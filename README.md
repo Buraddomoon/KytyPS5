@@ -418,6 +418,12 @@ SDL_VULKAN_LIBRARY=/path/to/libMoltenVK.dylib ./kyty_emulator --game "/games/Exa
 Run `kyty_emulator --help` to see the available graphics, logging, validation, profiling, and
 debugging options.
 
+In Astro's Playroom and other games that ask you to blow into the microphone, hold **M** to
+simulate blowing. This also works with **Audio > Microphone > None**, including when a Bluetooth
+controller has no microphone input. Release the key to return to the selected microphone or
+silence. Change the **Blow into microphone (hold)** binding in the input mapping dialog, or use
+`MicrophoneBlow=<key>` in a custom keymap.
+
 ### AI Use
 
 AI tools may be used for research, reverse engineering, and development assistance. Contributors

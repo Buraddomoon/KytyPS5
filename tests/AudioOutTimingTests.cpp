@@ -1,15 +1,18 @@
 // Exercise production output scheduling with a deterministic clock and consuming SDL queues.
 #include "common/threads.h"
 #include "libs/dualSenseHaptics.h"
+#include "libs/microphone.h"
 
 #include <SDL3/SDL.h>
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <type_traits>
 #include <vector>
 
 namespace {
@@ -36,6 +39,7 @@ bool                                 pad_connected = false, pad_bluetooth = fals
 uint64_t                             pad_queue_us = 0;
 const float*                         queued_pad_gains = nullptr;
 int                                  clears = 0;
+bool                                 recording_present = false;
 
 Stream& GetStream(SDL_AudioStream* stream) {
 	return *reinterpret_cast<Stream*>(stream);
@@ -105,6 +109,24 @@ bool ClearAudioStream(SDL_AudioStream* stream) {
 	clears++;
 	return true;
 }
+
+SDL_AudioDeviceID* GetAudioRecordingDevices(int* count) {
+	*count = recording_present ? 1 : 0;
+	auto* devices = static_cast<SDL_AudioDeviceID*>(SDL_malloc(2 * sizeof(SDL_AudioDeviceID)));
+	devices[0] = recording_present ? 99 : 0;
+	devices[1] = 0;
+	return devices;
+}
+
+const char* GetAudioDeviceName(SDL_AudioDeviceID) { return "Test microphone"; }
+SDL_AudioDeviceID GetAudioStreamDevice(SDL_AudioStream*) { return 99; }
+bool AudioDevicePaused(SDL_AudioDeviceID) { return false; }
+bool PauseAudioStreamDevice(SDL_AudioStream*) { return true; }
+int GetAudioStreamAvailable(SDL_AudioStream*) { return 4096; }
+int GetAudioStreamData(SDL_AudioStream*, void* data, int bytes) {
+	std::fill_n(static_cast<float*>(data), bytes / sizeof(float), 0.125f);
+	return bytes;
+}
 } // namespace Fake
 
 namespace Common {
@@ -126,6 +148,13 @@ public:
 #define SDL_GetAudioStreamQueued    Fake::GetAudioStreamQueued
 #define SDL_PutAudioStreamData      Fake::PutAudioStreamData
 #define SDL_ClearAudioStream        Fake::ClearAudioStream
+#define SDL_GetAudioRecordingDevices Fake::GetAudioRecordingDevices
+#define SDL_GetAudioDeviceName Fake::GetAudioDeviceName
+#define SDL_GetAudioStreamDevice Fake::GetAudioStreamDevice
+#define SDL_AudioDevicePaused Fake::AudioDevicePaused
+#define SDL_PauseAudioStreamDevice Fake::PauseAudioStreamDevice
+#define SDL_GetAudioStreamAvailable Fake::GetAudioStreamAvailable
+#define SDL_GetAudioStreamData Fake::GetAudioStreamData
 #include "libs/audio.cpp"
 #undef Thread
 #undef SDL_InitSubSystem
@@ -136,6 +165,13 @@ public:
 #undef SDL_GetAudioStreamQueued
 #undef SDL_PutAudioStreamData
 #undef SDL_ClearAudioStream
+#undef SDL_GetAudioRecordingDevices
+#undef SDL_GetAudioDeviceName
+#undef SDL_GetAudioStreamDevice
+#undef SDL_AudioDevicePaused
+#undef SDL_PauseAudioStreamDevice
+#undef SDL_GetAudioStreamAvailable
+#undef SDL_GetAudioStreamData
 
 namespace Libs::Controller {
 int GetActiveControllerId() {
@@ -189,6 +225,7 @@ struct Fixture {
 		pad_connected = pad_bluetooth = false;
 		pad_queue_us = 0;
 		queued_pad_gains = nullptr;
+		recording_present = false;
 		sleeps.clear();
 	}
 
@@ -456,6 +493,111 @@ void TestChannelGains() {
 	Check(queued_pad_gains != nullptr && queued_pad_gains[0] == gains[0] && queued_pad_gains[1] == gains[1],
 	      "connected controller did not receive channel gains");
 }
+
+template <typename Sample>
+void TestMicrophoneBlow(Audio::Format format, uint32_t channels, uint32_t frequency, bool asynchronous) {
+	Fixture f;
+	using Libs::Audio::Microphone;
+	constexpr uint32_t frames = 128;
+	const auto port = f.audio.AudioInOpen(frames, frequency, format, asynchronous);
+	Check(port.IsValid(), "microphone port did not open without a recording device");
+	std::vector<Sample> pcm(frames * channels + 1, Sample {1});
+	Check(f.audio.AudioInInput(port, pcm.data()) == frames &&
+	          std::all_of(pcm.begin(), pcm.end() - 1, [](Sample s) { return s == 0; }) &&
+	          pcm.back() == Sample {1},
+	      "inactive microphone changed device-free silence or overwrote its buffer");
+	Check(f.audio.AudioInGetSilentState(port) == 0, "idle synthetic microphone reported device absence");
+	Microphone::SetBlowing(true);
+	Check(f.audio.AudioInGetSilentState(port) == 0, "synthetic microphone reported device absence");
+	const auto start = now;
+	Check(f.audio.AudioInInput(port, pcm.data()) == frames && pcm.back() == Sample {1},
+	      "blowing changed the frame count or overwrote its buffer");
+	Check(now - start == 1000000ULL * frames / frequency, "synthetic input lost microphone pacing");
+	double energy = 0;
+	bool positive = false, negative = false;
+	for (auto it = pcm.begin(); it != pcm.end() - 1; ++it) {
+		const double value = static_cast<double>(*it) / (std::is_same_v<Sample, float> ? 1.0 : 32768.0);
+		Check(std::isfinite(value) && value >= -0.5 && value <= 0.5,
+		      "synthetic microphone samples exceeded PCM limits");
+		energy += value * value;
+		positive |= value > 0;
+		negative |= value < 0;
+	}
+	Check(positive && negative && energy / (frames * channels) > 0.04,
+	      "synthetic microphone did not supply an audible noise signal");
+	const auto first = pcm;
+	f.audio.AudioInInput(port, pcm.data());
+	Check(pcm != first, "synthetic microphone repeated the same block");
+	Check(f.audio.AudioInInput(port, nullptr) == 0, "pausing synthetic input returned frames");
+	Microphone::SetBlowing(false);
+	f.audio.AudioInInput(port, pcm.data());
+	Check(std::all_of(pcm.begin(), pcm.end() - 1, [](Sample s) { return s == 0; }) &&
+	          pcm.back() == Sample {1} && f.audio.AudioInGetSilentState(port) == 0,
+	      "releasing the blow key did not restore device-free silence");
+	Check(f.audio.AudioInClose(port) == 0, "synthetic microphone port did not close");
+	Microphone::SetBlowing(true);
+	Check(f.audio.AudioInGetSilentState(port) == Libs::Audio::AUDIO_IN_ERROR_INVALID_HANDLE &&
+	          f.audio.AudioInInput(port, pcm.data()) == Libs::Audio::AUDIO_IN_ERROR_INVALID_HANDLE,
+	      "blowing bypassed microphone handle validation");
+	Microphone::SetBlowing(false);
+	Microphone::SetAvailable(false);
+	const auto unmapped = f.audio.AudioInOpen(frames, frequency, format, asynchronous);
+	Check(f.audio.AudioInGetSilentState(unmapped) != 0,
+	      "unmapped synthetic microphone hid device absence");
+	Check(f.audio.AudioInClose(unmapped) == 0, "unmapped microphone port did not close");
+	Microphone::SetAvailable(true);
+}
+
+void TestMicrophoneFormats() {
+	Config::Initialize();
+	Config::Load(Config::ConfigOptions {});
+	for (const auto frequency: {16000u, 48000u}) {
+		for (bool asynchronous: {false, true}) {
+			TestMicrophoneBlow<int16_t>(Audio::Format::Signed16bitMono, 1, frequency, asynchronous);
+			TestMicrophoneBlow<int16_t>(Audio::Format::Signed16bitStereo, 2, frequency, asynchronous);
+			TestMicrophoneBlow<float>(Audio::Format::FloatMono, 1, frequency, asynchronous);
+			TestMicrophoneBlow<float>(Audio::Format::FloatStereo, 2, frequency, asynchronous);
+		}
+	}
+	Config::Shutdown();
+}
+
+void TestMicrophoneCaptureRecovery() {
+	Fixture f;
+	using Libs::Audio::Microphone;
+	Config::Initialize();
+	Config::ConfigOptions options;
+	options.audio_input_device = "Test microphone";
+	Config::Load(options);
+	recording_present = true;
+	const auto port = f.audio.AudioInOpen(128, 48000, Audio::Format::FloatMono, false);
+	Check(port.IsValid() && streams.size() == 1, "configured microphone did not open");
+	std::array<float, 128> pcm {};
+	f.audio.AudioInInput(port, pcm.data());
+	Check(std::all_of(pcm.begin(), pcm.end(), [](float s) { return s == 0.125f; }),
+	      "selected microphone capture did not reach the guest");
+	Microphone::SetBlowing(true);
+	const auto start = now;
+	f.audio.AudioInInput(port, pcm.data());
+	Check(now - start == 2666 && clears == 1 &&
+	          std::any_of(pcm.begin(), pcm.end(), [](float s) { return s < 0; }),
+	      "blowing did not temporarily replace and drain microphone capture");
+	Microphone::SetBlowing(false);
+	f.audio.AudioInInput(port, pcm.data());
+	Check(std::all_of(pcm.begin(), pcm.end(), [](float s) { return s == 0.125f; }) && streams.size() == 1,
+	      "releasing the blow key did not restore the selected microphone");
+	recording_present = false;
+	Microphone::SetBlowing(true);
+	f.audio.AudioInInput(port, pcm.data());
+	Check(streams.size() == 1 && f.audio.AudioInGetSilentState(port) == 0,
+	      "unplugging a microphone disabled the synthetic input");
+	Microphone::SetBlowing(false);
+	f.audio.AudioInInput(port, pcm.data());
+	Check(streams.empty() && std::all_of(pcm.begin(), pcm.end(), [](float s) { return s == 0; }),
+	      "unplugged microphone did not return to silence after blowing");
+	Check(f.audio.AudioInClose(port) == 0, "capture microphone port did not close");
+	Config::Shutdown();
+}
 } // namespace
 
 int main() {
@@ -470,6 +612,8 @@ int main() {
 	TestInvalidBatchSize();
 	TestZeroOutputFrequency();
 	TestChannelGains();
+	TestMicrophoneFormats();
+	TestMicrophoneCaptureRecovery();
 	Check(streams.empty(), "output stream leaked");
 	std::puts("AudioOutTimingTests: all cases passed");
 }

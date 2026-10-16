@@ -161,12 +161,12 @@ void TestDisabledMappingTabs() {
 	const auto south = InputMap::SourceFromButton(SDL_GAMEPAD_BUTTON_SOUTH);
 	Config::Load(options);
 	const InputMap defaults;
-	Check(!defaults.Custom() && defaults.PadControl(south) == ControlFromName("Cross"),
+	Check(!defaults.Custom() && defaults.HasMicrophone() && defaults.PadControl(south) == ControlFromName("Cross"),
 	      "empty configuration lost its default mappings");
 	options.keymap = {"Keyboard=Disabled"};
 	Config::Load(options);
 	const InputMap keyboard_disabled;
-	Check(keyboard_disabled.Custom() && keyboard_disabled.FindKey(SDLK_J) == INVALID_CONTROL &&
+	Check(keyboard_disabled.Custom() && !keyboard_disabled.HasMicrophone() && keyboard_disabled.FindKey(SDLK_J) == INVALID_CONTROL &&
 	          keyboard_disabled.PadControl(south) == ControlFromName("Cross"),
 	      "disabling keyboard mappings changed gamepad defaults or restored keyboard input");
 	for (const auto& keymap: {Config::Keymap {"Pad=Disabled"},
@@ -188,6 +188,32 @@ void TestDisabledMappingTabs() {
 	          mapped.PadControl(south) == ControlFromName("Circle"),
 	      "explicit mappings no longer override defaults");
 }
+
+void TestMicrophoneBlowInput() {
+	Inputs inputs;
+	HostInputKey(SDLK_M, true);
+	Check(Libs::Audio::Microphone::IsBlowing(), "M did not start microphone blowing");
+	HostInputKey(SDLK_M, false);
+	Check(!Libs::Audio::Microphone::IsBlowing(), "releasing M retained microphone blowing");
+	HostInputKey(SDLK_M, true);
+	HostInputFocusLost();
+	Check(!Libs::Audio::Microphone::IsBlowing(), "losing focus retained microphone blowing");
+	HostInputKey(SDLK_M, true);
+	HostInputShutdown();
+	Check(!Libs::Audio::Microphone::IsBlowing(), "shutdown retained microphone blowing");
+	HostInputInit(nullptr);
+
+	Config::ConfigOptions options;
+	options.keymap = {"MicrophoneBlow=B"};
+	Config::Load(options);
+	const InputMap remapped;
+	Check(remapped.HasMicrophone(), "remapped blow key did not expose a synthetic microphone");
+	Check(remapped.FindKey(SDLK_M) == INVALID_CONTROL, "remapping retained the default blow key");
+	SetControl(remapped.FindKey(SDLK_B), true);
+	Check(Libs::Audio::Microphone::IsBlowing(), "remapped key did not start microphone blowing");
+	SetControl(remapped.FindKey(SDLK_B), false);
+	Check(!Libs::Audio::Microphone::IsBlowing(), "remapped key release retained microphone blowing");
+}
 } // namespace
 
 int main() {
@@ -199,6 +225,7 @@ int main() {
 	TestKeyboardSwitchesFromGamepadTouchPad();
 	TestIndependentTriggerEdges();
 	TestTriggerLifecycleReset();
+	TestMicrophoneBlowInput();
 	TestDisabledMappingTabs();
 	Config::Shutdown();
 	return 0;
